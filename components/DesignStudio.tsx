@@ -1,7 +1,10 @@
+
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, Wand2, Download, Image as ImageIcon, X, Sparkles, Sprout, Palette, SplitSquareHorizontal } from 'lucide-react';
+import { Upload, Wand2, Download, Image as ImageIcon, X, Sparkles, Sprout, Palette, SplitSquareHorizontal, Undo, Redo, Save, Folder } from 'lucide-react';
 import { Button } from './Button';
 import { generateLandscapeDesign } from '../services/geminiService';
+import { dbService } from '../services/dbService';
+import { Client, User } from '../types';
 
 interface DesignHistoryItem {
   id: string;
@@ -9,6 +12,12 @@ interface DesignHistoryItem {
   generatedImage: string;
   prompt: string;
   timestamp: number;
+}
+
+interface DesignStudioProps {
+  user?: User;
+  currentClientId?: string;
+  onBackToDashboard?: () => void;
 }
 
 const EXAMPLE_PROMPTS = [
@@ -34,13 +43,22 @@ const EXAMPLE_PROMPTS = [
   }
 ];
 
-export const DesignStudio: React.FC = () => {
+export const DesignStudio: React.FC<DesignStudioProps> = ({ user, currentClientId, onBackToDashboard }) => {
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [mimeType, setMimeType] = useState<string>('image/jpeg');
   const [generatedImage, setGeneratedImage] = useState<string | null>(null);
   const [prompt, setPrompt] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  
+  // Client selection for saving
+  const [availableClients, setAvailableClients] = useState<Client[]>([]);
+  const [selectedSaveClientId, setSelectedSaveClientId] = useState<string>(currentClientId || '');
+  const [showSaveModal, setShowSaveModal] = useState(false);
+  
+  // History is now chronological: [Oldest, ..., Newest]
   const [history, setHistory] = useState<DesignHistoryItem[]>([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
   
   // Loading animation state
   const [progress, setProgress] = useState(0);
@@ -52,14 +70,24 @@ export const DesignStudio: React.FC = () => {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const sliderRef = useRef<HTMLDivElement>(null);
-  const resultRef = useRef<HTMLDivElement>(null); // Ref for auto-scrolling on mobile
+  const resultRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (user) {
+        dbService.getClients(user.id).then(setAvailableClients);
+    }
+    if (currentClientId) {
+        setSelectedSaveClientId(currentClientId);
+    }
+  }, [user, currentClientId]);
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
       const reader = new FileReader();
       reader.onloadend = () => {
-        setSelectedImage(reader.result as string);
+        const result = reader.result as string;
+        setSelectedImage(result);
         setMimeType(file.type);
         setGeneratedImage(null);
         setIsCompareMode(false);
@@ -78,7 +106,6 @@ export const DesignStudio: React.FC = () => {
       if (result) {
         setGeneratedImage(result);
         
-        // Add to history
         const newItem: DesignHistoryItem = {
           id: Date.now().toString(),
           originalImage: selectedImage,
@@ -87,7 +114,18 @@ export const DesignStudio: React.FC = () => {
           timestamp: Date.now()
         };
         
-        setHistory(prev => [newItem, ...prev].slice(0, 10)); // Keep last 10
+        setHistory(prev => {
+          const pastHistory = prev.slice(0, historyIndex + 1);
+          if (pastHistory.length >= 20) {
+             return [...pastHistory.slice(1), newItem];
+          }
+          return [...pastHistory, newItem];
+        });
+
+        setHistoryIndex(prev => {
+           return (historyIndex + 1 >= 20) ? 19 : historyIndex + 1;
+        });
+
       } else {
         alert("Could not generate image. Please try again.");
       }
@@ -98,6 +136,13 @@ export const DesignStudio: React.FC = () => {
       setIsLoading(false);
     }
   };
+
+  // Fix history index sync after state update
+  useEffect(() => {
+     if (history.length > 0 && historyIndex === -1) {
+         setHistoryIndex(history.length - 1);
+     }
+  }, [history.length]);
 
   const clearImage = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -113,36 +158,68 @@ export const DesignStudio: React.FC = () => {
     setPrompt(item.prompt);
     setIsCompareMode(false);
     
-    // Auto scroll to result if on mobile
+    const match = item.originalImage.match(/data:(image\/[a-zA-Z]*);base64/);
+    if (match && match[1]) {
+        setMimeType(match[1]);
+    }
+
+    const index = history.findIndex(h => h.id === item.id);
+    if (index !== -1) {
+        setHistoryIndex(index);
+    }
+    
     if (window.innerWidth < 768) {
       setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
     }
   };
 
-  // Compare Slider Logic
+  const handleUndo = () => {
+    if (historyIndex > 0) {
+      const newIndex = historyIndex - 1;
+      loadHistoryItem(history[newIndex]);
+    }
+  };
+
+  const handleRedo = () => {
+    if (historyIndex < history.length - 1) {
+      const newIndex = historyIndex + 1;
+      loadHistoryItem(history[newIndex]);
+    }
+  };
+
   const handleSliderMove = (e: React.MouseEvent | React.TouchEvent) => {
     if (!sliderRef.current) return;
-    
-    // Prevent scrolling while dragging slider on mobile
-    if (e.type === 'touchmove') {
-      // e.preventDefault(); // React synthetic events can't always prevent default in passive listeners
-    }
-
     const rect = sliderRef.current.getBoundingClientRect();
     const x = 'touches' in e ? e.touches[0].clientX : (e as React.MouseEvent).clientX;
     const position = ((x - rect.left) / rect.width) * 100;
-    
     setComparePos(Math.min(Math.max(position, 0), 100));
   };
 
-  // Auto-scroll to result when generation completes (Mobile experience)
+  const handleSaveToClient = async () => {
+      if (!user || !selectedSaveClientId || !generatedImage || !selectedImage) return;
+      
+      setIsSaving(true);
+      try {
+          await dbService.saveDesign(user.id, selectedSaveClientId, {
+              original: selectedImage,
+              generated: generatedImage,
+              prompt: prompt
+          });
+          alert("Design saved successfully!");
+          setShowSaveModal(false);
+      } catch (e) {
+          alert("Failed to save.");
+      } finally {
+          setIsSaving(false);
+      }
+  };
+
   useEffect(() => {
     if (generatedImage && !isLoading && window.innerWidth < 768) {
       resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
   }, [generatedImage, isLoading]);
 
-  // Simulation of progress bar and status updates
   useEffect(() => {
     if (isLoading) {
       setProgress(0);
@@ -177,19 +254,77 @@ export const DesignStudio: React.FC = () => {
   }, [isLoading]);
 
   return (
-    <div className="h-full w-full flex flex-col md:flex-row overflow-y-auto md:overflow-hidden">
+    <div className="h-full w-full flex flex-col md:flex-row overflow-y-auto md:overflow-hidden relative">
       
-      {/* Left Panel: Inputs 
-          - Mobile: Full width, scrollable
-          - Tablet/Desktop: Fixed width sidebar
-      */}
-      <div className="w-full md:w-[340px] lg:w-[450px] p-4 md:p-6 lg:p-8 flex flex-col gap-6 md:gap-8 border-b md:border-b-0 md:border-r border-[#A4BAA8]/20 bg-[#646E57]/80 backdrop-blur-xl overflow-y-auto shrink-0 z-20 shadow-2xl custom-scrollbar pb- safe">
-        
-        <div>
-          <div className="flex items-center gap-2 mb-2">
-            <h1 className="text-xl md:text-2xl font-serif font-medium tracking-tight text-[#E2D2BC]">Project Vision</h1>
+      {/* Save Modal */}
+      {showSaveModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+              <div className="bg-[#646E57] border border-[#A4BAA8]/20 p-6 rounded-2xl w-full max-w-sm shadow-2xl">
+                  <h3 className="text-xl font-serif text-[#E2D2BC] mb-4">Save to Client Folder</h3>
+                  <div className="space-y-4">
+                      <div className="space-y-2">
+                          <label className="text-xs uppercase text-[#A4BAA8]">Select Client</label>
+                          <select 
+                             className="w-full px-4 py-3 bg-black/20 border border-[#A4BAA8]/20 rounded-xl text-[#E2D2BC] focus:outline-none focus:border-[#E2D2BC]"
+                             value={selectedSaveClientId}
+                             onChange={e => setSelectedSaveClientId(e.target.value)}
+                          >
+                              <option value="" disabled>Select a folder...</option>
+                              {availableClients.map(c => (
+                                  <option key={c.id} value={c.id}>{c.name}</option>
+                              ))}
+                          </select>
+                      </div>
+                      <div className="flex gap-3 pt-2">
+                          <Button variant="ghost" onClick={() => setShowSaveModal(false)} className="flex-1">Cancel</Button>
+                          <Button 
+                            variant="primary" 
+                            className="flex-1"
+                            disabled={!selectedSaveClientId || isSaving}
+                            onClick={handleSaveToClient}
+                            isLoading={isSaving}
+                          >
+                            Save Design
+                          </Button>
+                      </div>
+                  </div>
+              </div>
           </div>
-          <p className="text-[#A4BAA8] text-xs md:text-sm">Upload a site photo and describe your landscape transformation.</p>
+      )}
+
+      {/* Left Panel: Inputs */}
+      <div className="w-full md:w-[340px] lg:w-[450px] p-4 md:p-6 lg:p-8 flex flex-col gap-6 md:gap-8 border-b md:border-b-0 md:border-r border-[#A4BAA8]/20 bg-[#646E57]/80 backdrop-blur-xl overflow-y-auto shrink-0 z-20 shadow-2xl custom-scrollbar pb-safe">
+        
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              {onBackToDashboard && (
+                 <button onClick={onBackToDashboard} className="md:hidden mr-2 text-[#E2D2BC]"><Undo className="h-4 w-4" /></button>
+              )}
+              <h1 className="text-xl md:text-2xl font-serif font-medium tracking-tight text-[#E2D2BC]">Project Vision</h1>
+            </div>
+            <p className="text-[#A4BAA8] text-xs md:text-sm">Upload a site photo and describe your landscape transformation.</p>
+          </div>
+          
+          <div className="flex items-center gap-1 bg-[#2c3325]/30 p-1 rounded-lg border border-[#A4BAA8]/10">
+            <button 
+              onClick={handleUndo} 
+              disabled={historyIndex <= 0}
+              className="p-2 text-[#E2D2BC] hover:bg-[#E2D2BC]/10 disabled:opacity-30 disabled:hover:bg-transparent rounded-md transition-colors"
+              title="Undo"
+            >
+              <Undo className="h-4 w-4" />
+            </button>
+            <div className="w-px h-4 bg-[#A4BAA8]/20"></div>
+            <button 
+              onClick={handleRedo} 
+              disabled={historyIndex === -1 || historyIndex >= history.length - 1}
+              className="p-2 text-[#E2D2BC] hover:bg-[#E2D2BC]/10 disabled:opacity-30 disabled:hover:bg-transparent rounded-md transition-colors"
+              title="Redo"
+            >
+              <Redo className="h-4 w-4" />
+            </button>
+          </div>
         </div>
 
         {/* Upload Area */}
@@ -246,7 +381,6 @@ export const DesignStudio: React.FC = () => {
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               placeholder="Describe the landscape design..."
-              // text-base prevents iOS zoom on focus
               className="w-full flex-1 bg-[#E2D2BC]/10 focus:bg-[#E2D2BC]/20 border border-[#A4BAA8]/20 focus:border-[#E2D2BC]/50 rounded-2xl p-4 text-[#E2D2BC] placeholder-[#A4BAA8]/60 focus:outline-none resize-none transition-all text-base md:text-sm leading-relaxed appearance-none"
             />
             <div className="absolute bottom-4 right-4 pointer-events-none">
@@ -254,12 +388,10 @@ export const DesignStudio: React.FC = () => {
             </div>
           </div>
           
-          {/* Quick Inspiration Pills */}
           <div className="space-y-2">
             <div className="flex items-center gap-2 text-[#A4BAA8] text-[10px] uppercase tracking-widest font-semibold">
                <Palette className="h-3 w-3" /> Quick Inspiration
             </div>
-            {/* Scrollable container with snap for nice touch feel */}
             <div className="flex gap-2 overflow-x-auto pb-2 custom-scrollbar snap-x touch-pan-x">
               {EXAMPLE_PROMPTS.map((ex, i) => (
                 <button
@@ -274,7 +406,6 @@ export const DesignStudio: React.FC = () => {
           </div>
         </div>
 
-        {/* Generate Action */}
         <div>
           <Button 
             onClick={handleGenerate} 
@@ -295,7 +426,6 @@ export const DesignStudio: React.FC = () => {
           </Button>
         </div>
 
-        {/* Recent History Section */}
         {history.length > 0 && (
           <div className="pt-6 border-t border-[#A4BAA8]/20 animate-in fade-in slide-in-from-bottom-4 duration-500">
              <label className="text-xs font-semibold text-[#E2D2BC] uppercase tracking-wider flex items-center gap-2 mb-4">
@@ -303,16 +433,22 @@ export const DesignStudio: React.FC = () => {
                 Recent Concepts
              </label>
              <div className="grid grid-cols-2 gap-3">
-               {history.map((item) => (
+               {[...history].reverse().map((item) => (
                  <button
                     key={item.id}
                     onClick={() => loadHistoryItem(item)}
-                    className="group relative rounded-xl overflow-hidden aspect-[4/3] border border-[#A4BAA8]/20 active:border-[#E2D2BC] transition-all bg-black/20 active:scale-95"
+                    className={`group relative rounded-xl overflow-hidden aspect-[4/3] border transition-all bg-black/20 active:scale-95 ${
+                        item.generatedImage === generatedImage 
+                        ? 'border-[#E2D2BC] ring-1 ring-[#E2D2BC]/50' 
+                        : 'border-[#A4BAA8]/20 active:border-[#E2D2BC]'
+                    }`}
                  >
                    <img 
                      src={item.generatedImage} 
                      alt="History item" 
-                     className="w-full h-full object-cover opacity-70 group-hover:opacity-100 transition-opacity"
+                     className={`w-full h-full object-cover transition-opacity ${
+                        item.generatedImage === generatedImage ? 'opacity-100' : 'opacity-70 group-hover:opacity-100'
+                     }`}
                    />
                    {item.generatedImage === generatedImage && (
                      <div className="absolute top-2 right-2 w-2 h-2 rounded-full bg-[#E2D2BC] shadow-[0_0_8px_rgba(226,210,188,0.8)]"></div>
@@ -329,16 +465,13 @@ export const DesignStudio: React.FC = () => {
         ref={resultRef}
         className="flex-1 relative overflow-hidden flex items-center justify-center min-h-[500px] md:min-h-0 bg-black/10"
       >
-        
         <div className="absolute inset-y-0 left-0 w-24 bg-gradient-to-r from-[#646E57]/50 to-transparent pointer-events-none" />
         
         {generatedImage ? (
           <div className="relative w-full h-full p-4 md:p-8 lg:p-12 flex flex-col items-center justify-center animate-in fade-in duration-700">
             
-            {/* Image Container with Toolbar */}
             <div className="relative max-w-full max-h-[80vh] md:max-h-[85vh] shadow-2xl rounded-xl ring-1 md:ring-4 ring-[#E2D2BC]/10 backdrop-blur-sm bg-black/20 overflow-hidden group touch-none">
               
-              {/* Main Image Display Area with CSS Slider */}
               <div 
                 ref={sliderRef}
                 className="relative select-none inline-block touch-none"
@@ -346,7 +479,6 @@ export const DesignStudio: React.FC = () => {
                 onTouchMove={isCompareMode ? (e) => handleSliderMove(e) : undefined}
                 onClick={isCompareMode ? (e) => handleSliderMove(e) : undefined}
               >
-                {/* Result Image (Right/New) - Base Layer */}
                 <img 
                   src={generatedImage} 
                   alt="Generated Design" 
@@ -354,7 +486,6 @@ export const DesignStudio: React.FC = () => {
                   draggable={false}
                 />
 
-                {/* Compare Mode Overlay: Original Image (Left/Old) - Top Layer */}
                 {isCompareMode && selectedImage && (
                   <div 
                     className="absolute top-0 left-0 h-full overflow-hidden border-r-2 border-white/90 shadow-[2px_0_10px_rgba(0,0,0,0.3)] pointer-events-none"
@@ -369,7 +500,6 @@ export const DesignStudio: React.FC = () => {
                   </div>
                 )}
 
-                {/* Slider Handle - Touch optimized */}
                 {isCompareMode && (
                    <div 
                      className="absolute inset-y-0 w-8 -ml-4 z-20 cursor-ew-resize touch-none flex items-center justify-center"
@@ -382,8 +512,8 @@ export const DesignStudio: React.FC = () => {
                 )}
               </div>
 
-              {/* Floating Toolbar */}
-              <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 p-1.5 bg-[#646E57]/90 backdrop-blur-md rounded-full border border-[#A4BAA8]/20 shadow-xl opacity-100 md:opacity-0 md:group-hover:opacity-100 transition-all duration-300 md:translate-y-2 md:group-hover:translate-y-0 z-30">
+              {/* Toolbar */}
+              <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 p-1.5 bg-[#646E57]/90 backdrop-blur-md rounded-full border border-[#A4BAA8]/20 shadow-xl z-30">
                  
                  <button 
                    onClick={() => setIsCompareMode(!isCompareMode)}
@@ -398,6 +528,14 @@ export const DesignStudio: React.FC = () => {
                  </button>
 
                  <div className="w-px h-4 bg-[#A4BAA8]/30 mx-1"></div>
+
+                 <button 
+                   onClick={() => setShowSaveModal(true)}
+                   className="p-2 text-[#E2D2BC] hover:text-white hover:bg-white/10 rounded-full transition-colors active:scale-90"
+                   title="Save to Client"
+                 >
+                   <Save className="h-4 w-4" />
+                 </button>
 
                  <a 
                    href={generatedImage} 
@@ -444,7 +582,7 @@ export const DesignStudio: React.FC = () => {
                 </div>
                 <h3 className="text-lg md:text-xl font-medium text-[#E2D2BC] mb-2 md:mb-3">Ready to Create</h3>
                 <p className="text-[#A4BAA8] leading-relaxed text-sm md:text-base">
-                  Your generated landscape concepts will bloom here.
+                  {currentClientId ? "Project selected. Upload a photo to begin." : "Select a client or upload a photo to start."}
                 </p>
               </div>
             )}

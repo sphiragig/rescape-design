@@ -16,6 +16,8 @@ export interface ChatSession {
 
 export enum ViewState {
   LANDING = 'LANDING',
+  AUTH = 'AUTH',
+  DASHBOARD = 'DASHBOARD',
   APP = 'APP',
 }
 
@@ -32,9 +34,29 @@ export enum ModelId {
   IMAGE = 'gemini-2.5-flash-image',
 }
 
-export interface AnalyticsData {
+export interface User {
+  id: string;
   name: string;
-  tokens: number;
-  cost: number;
-  latency: number;
+  email: string;
+  password?: string; // stored locally for demo only
+}
+
+export interface Client {
+  id: string;
+  userId: string;
+  name: string;
+  email?: string;
+  phone?: string;
+  address?: string;
+  createdAt: number;
+}
+
+export interface ProjectDesign {
+  id: string;
+  clientId: string;
+  userId: string;
+  originalImage: string;
+  generatedImage: string;
+  prompt: string;
+  timestamp: number;
 }
